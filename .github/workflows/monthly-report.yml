@@ -1,0 +1,49 @@
+name: Monthly Inhouse Hours Report
+
+on:
+  schedule:
+    # Run on the 15th of every month at 00:00 UTC
+    - cron: '0 0 15 * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  generate-report:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Create Google credentials file
+      run: |
+        echo "${{ secrets.GOOGLE_CREDS }}" > creds.json
+
+    - name: Run report generation script
+      env:
+        GOOGLE_CREDS_FILE: creds.json
+        DELIVERY_SHEET_KEY: ${{ secrets.DELIVERY_SHEET_KEY }}
+        DELIVERY_WORKSHEET_NAME: ${{ secrets.DELIVERY_WORKSHEET_NAME || 'Team List & Activity' }}
+        REPORT_SHEET_KEY: ${{ secrets.REPORT_SHEET_KEY }}
+        REPORT_WORKSHEET_NAME: ${{ secrets.REPORT_WORKSHEET_NAME || 'Merged' }}
+        OUTPUT_SHEET_KEY: ${{ secrets.OUTPUT_SHEET_KEY }}
+        OUTPUT_BREAKDOWN_WORKSHEET: ${{ secrets.OUTPUT_BREAKDOWN_WORKSHEET || 'Total Breakdown' }}
+        OUTPUT_SUMMARY_WORKSHEET: ${{ secrets.OUTPUT_SUMMARY_WORKSHEET || 'Summary' }}
+        REPORT_YEAR_FILTER: ${{ secrets.REPORT_YEAR_FILTER || '2026' }}
+        LOG_LEVEL: INFO
+      run: |
+        python inhouse_members_active_days_and_effective_hour_stats.py
+
+    - name: Clean up credentials
+      if: always()
+      run: |
+        rm -f creds.json
