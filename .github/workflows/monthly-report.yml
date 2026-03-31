@@ -26,7 +26,7 @@ jobs:
 
     - name: Create Google credentials file
       run: |
-        echo "${{ secrets.GOOGLE_CREDS }}" > creds.json
+        echo "${{ secrets.GOOGLE_CREDS }}" | base64 -d > creds.json
 
     - name: Run report generation script
       env:
