@@ -33,7 +33,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import gspread
 import pandas as pd
@@ -68,14 +68,9 @@ NUMERIC_COLUMNS = [
 ]
 
 ID_COLUMNS = ["QAI ID", "Full Name", "Resource Type", "Resource Allocation"]
+BREAKDOWN_ID_COLUMNS = ["QAI ID", "Full Name", "Joining Date", "Resource Type", "Resource Allocation"]
 REPORT_REQUIRED_COLUMNS = ["REPORT_MONTH", *ID_COLUMNS, *NUMERIC_COLUMNS]
-SUMMARY_METRICS = [
-    "Annotation Time (Minutes)",
-    "QA Time (Minutes)",
-    "Total Logged Hours",
-    "Active Days",
-    "Active Days Office Hours",
-]
+
 PRIORITY_ORDER = [
     "Effective Work Hour",
     "Final Working Hour",
@@ -95,6 +90,24 @@ PRIORITY_ORDER = [
     "Free time (Minutes)",
     "Active Days",
     "Active Days Office Hours",
+]
+
+PRODUCTION_SOURCE_METRICS = [
+    "Annotation Time (Minutes)",
+    "QA Time (Minutes)",
+]
+
+OTHER_TIME_SOURCE_METRICS = [
+    "Crosscheck Time (Minutes)",
+    "Meeting Time (Minutes)",
+    "Project Study (Minutes)",
+    "Resource Training (Minutes) - This section is for lead",
+    "Q&A Group support (Minutes)",
+    "Documentation (Minutes)",
+    "Demo (Minutes)",
+    "Break Time (Minutes)",
+    "Server Downtime (Minutes)",
+    "Free time (Minutes)",
 ]
 
 
@@ -202,9 +215,7 @@ def parse_args() -> Config:
 
 def validate_config(config: Config) -> None:
     if not os.path.isfile(config.creds_file):
-        raise ConfigurationError(
-            f"Credentials file not found: {config.creds_file}"
-        )
+        raise ConfigurationError(f"Credentials file not found: {config.creds_file}")
 
     required_values = {
         "delivery_sheet_key": config.delivery_sheet_key,
@@ -265,8 +276,22 @@ def require_columns(df: pd.DataFrame, required_columns: Sequence[str], label: st
         )
 
 
+def normalize_joining_date(value: object) -> str:
+    if value is None:
+        return ""
+    value_str = str(value).strip()
+    if not value_str:
+        return ""
+
+    parsed = pd.to_datetime(value_str, errors="coerce")
+    if pd.isna(parsed):
+        return value_str
+
+    return parsed.strftime("%Y-%m-%d")
+
+
 def build_inhouse_activity_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    require_columns(df, ["QAI ID"], "attendance worksheet")
+    require_columns(df, ["QAI ID", "Joining Date"], "attendance worksheet")
     LOGGER.info("Calculating active days and office hours from attendance sheet")
 
     date_columns: Dict[str, datetime] = {}
@@ -291,7 +316,11 @@ def build_inhouse_activity_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         if not qai_id:
             continue
 
-        record = {"QAI ID": qai_id}
+        record = {
+            "QAI ID": qai_id,
+            "Joining Date": normalize_joining_date(row.get("Joining Date", "")),
+        }
+
         for year_month, columns in sorted(month_groups.items()):
             year, month = year_month
             month_label = f"{datetime(year, month, 1).strftime('%B - %Y')} Active Days"
@@ -391,19 +420,19 @@ def build_final_breakdown_dataframe(
     activity_df: pd.DataFrame,
 ) -> pd.DataFrame:
     require_columns(report_metrics_df, ["QAI ID"], "report metrics dataframe")
-    require_columns(activity_df, ["QAI ID"], "activity dataframe")
+    require_columns(activity_df, ["QAI ID", "Joining Date"], "activity dataframe")
     LOGGER.info("Merging report metrics and attendance activity")
 
     merged_df = pd.merge(report_metrics_df, activity_df, on="QAI ID", how="left")
 
-    columns = [column for column in merged_df.columns if column != "QAI ID"]
+    columns = [column for column in merged_df.columns if column not in {"QAI ID", "Full Name", "Joining Date", "Resource Type", "Resource Allocation"}]
     month_groups: Dict[str, List[str]] = defaultdict(list)
     for column in columns:
         month_key = column.split("_")[0].split(" Active Days")[0].strip()
         month_groups[month_key].append(column)
 
     sorted_months = sorted(month_groups.keys(), key=month_sort_key)
-    ordered_columns = ["QAI ID"]
+    ordered_columns = BREAKDOWN_ID_COLUMNS.copy()
 
     def column_priority(column_name: str) -> int:
         for index, metric_name in enumerate(PRIORITY_ORDER):
@@ -424,22 +453,127 @@ def build_final_breakdown_dataframe(
 
 
 def build_summary_dataframe(final_df: pd.DataFrame) -> pd.DataFrame:
-    require_columns(final_df, ID_COLUMNS, "final breakdown dataframe")
-    LOGGER.info("Building summary dataframe")
+    require_columns(final_df, BREAKDOWN_ID_COLUMNS, "final breakdown dataframe")
+    LOGGER.info("Building row-wise monthly summary dataframe")
 
-    dynamic_columns = [
-        column
-        for column in final_df.columns
-        if any(column.endswith(metric) for metric in SUMMARY_METRICS)
-    ]
+    all_columns = list(final_df.columns)
+    month_names = sorted(
+        {
+            column.split("_")[0].split(" Active Days")[0].strip()
+            for column in all_columns
+            if column not in BREAKDOWN_ID_COLUMNS
+        },
+        key=month_sort_key,
+    )
 
-    summary_df = final_df[ID_COLUMNS + dynamic_columns].copy()
-    rename_map = {
-        column: column.replace("Total Logged Hours", "Other Hours")
-        for column in dynamic_columns
-        if "Total Logged Hours" in column
-    }
-    summary_df.rename(columns=rename_map, inplace=True)
+    rows: List[Dict[str, object]] = []
+
+    for _, row in final_df.iterrows():
+        base_record = {
+            "QAI ID": str(row.get("QAI ID", "")).strip(),
+            "Full Name": str(row.get("Full Name", "")).strip(),
+            "Joining Date": str(row.get("Joining Date", "")).strip(),
+            "Resource Type": str(row.get("Resource Type", "")).strip(),
+            "Resource Allocation": str(row.get("Resource Allocation", "")).strip(),
+        }
+
+        for month in month_names:
+            effective_col = f"{month}_Effective Work Hour"
+            active_days_col = f"{month} Active Days"
+            active_hour_col = f"{month} Active Days Office Hours"
+
+            effective_hours = pd.to_numeric(row.get(effective_col, 0), errors="coerce")
+            if pd.isna(effective_hours):
+                effective_hours = 0.0
+
+            production_hours = 0.0
+            for metric in PRODUCTION_SOURCE_METRICS:
+                col = f"{month}_{metric}"
+                value = pd.to_numeric(row.get(col, 0), errors="coerce")
+                if pd.isna(value):
+                    value = 0.0
+                production_hours += float(value)
+
+            other_hours = 0.0
+            for metric in OTHER_TIME_SOURCE_METRICS:
+                col = f"{month}_{metric}"
+                value = pd.to_numeric(row.get(col, 0), errors="coerce")
+                if pd.isna(value):
+                    value = 0.0
+                other_hours += float(value)
+
+            active_days = pd.to_numeric(row.get(active_days_col, 0), errors="coerce")
+            if pd.isna(active_days):
+                active_days = 0.0
+
+            active_hour = pd.to_numeric(row.get(active_hour_col, 0), errors="coerce")
+            if pd.isna(active_hour):
+                active_hour = 0.0
+
+            summary_row = {
+                **base_record,
+                "Month": month,
+                "Effective Hours": float(effective_hours),
+                "Production Hours": production_hours,
+                "Other Time Tracking Hours": other_hours,
+                "Active Days": float(active_days),
+                "Active Hour": float(active_hour),
+            }
+
+            if any(
+                summary_row[col] != 0
+                for col in [
+                    "Effective Hours",
+                    "Production Hours",
+                    "Other Time Tracking Hours",
+                    "Active Days",
+                    "Active Hour",
+                ]
+            ):
+                rows.append(summary_row)
+
+    summary_df = pd.DataFrame(rows)
+
+    if summary_df.empty:
+        summary_df = pd.DataFrame(
+            columns=[
+                "QAI ID",
+                "Full Name",
+                "Joining Date",
+                "Resource Type",
+                "Resource Allocation",
+                "Month",
+                "Effective Hours",
+                "Production Hours",
+                "Other Time Tracking Hours",
+                "Active Days",
+                "Active Hour",
+            ]
+        )
+    else:
+        summary_df["Month_sort"] = pd.to_datetime(
+            summary_df["Month"], format="%B - %Y", errors="coerce"
+        )
+        summary_df = summary_df.sort_values(
+            by=["QAI ID", "Month_sort", "Full Name"],
+            kind="stable",
+        ).drop(columns=["Month_sort"])
+
+        summary_df = summary_df[
+            [
+                "QAI ID",
+                "Full Name",
+                "Joining Date",
+                "Resource Type",
+                "Resource Allocation",
+                "Month",
+                "Effective Hours",
+                "Production Hours",
+                "Other Time Tracking Hours",
+                "Active Days",
+                "Active Hour",
+            ]
+        ].reset_index(drop=True)
 
     LOGGER.info(
         "Built summary dataframe with %s rows and %s columns",
