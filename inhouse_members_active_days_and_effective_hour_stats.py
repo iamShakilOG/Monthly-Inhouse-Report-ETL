@@ -108,6 +108,7 @@ INTERNAL_TIME_TRACKING_MINUTE_COLUMNS = [
     "Annotation Time (Minutes)",
     "QA Time (Minutes)",
     "Crosscheck Time (Minutes)",
+    "Other Production Time (Minutes)",
     "Meeting Time (Minutes)",
     "Project Study (Minutes)",
     "Resource Training (Minutes) - This section is for lead",
@@ -124,6 +125,7 @@ INTERNAL_TIME_TRACKING_HOUR_RENAMES = {
     "Annotation Time (Minutes)": "Annotation Hours",
     "QA Time (Minutes)": "QA Hours",
     "Crosscheck Time (Minutes)": "Crosscheck Hours",
+    "Other Production Time (Minutes)": "Other Production Hours",
     "Meeting Time (Minutes)": "Meeting Hours",
     "Project Study (Minutes)": "Project Study Hours",
     "Resource Training (Minutes) - This section is for lead": "Resource Training Hours",
@@ -138,6 +140,15 @@ INTERNAL_TIME_TRACKING_HOUR_RENAMES = {
 
 INTERNAL_TIME_TRACKING_GROUP_COLUMNS = ["QAI ID", "Month", "Year"]
 INTERNAL_TIME_TRACKING_HOUR_COLUMNS = list(INTERNAL_TIME_TRACKING_HOUR_RENAMES.values())
+
+# Time Tracking headers changed in August 2026.  Convert them to the
+# established internal names so historical and current source sheets both run.
+INTERNAL_TIME_TRACKING_HEADER_ALIASES = {
+    "effective annotation time (minutes)": "Annotation Time (Minutes)",
+    "effective qa time (minutes)": "QA Time (Minutes)",
+    "crosscheck time (minutes)": "Crosscheck Time (Minutes)",
+    "other production time (minutes)": "Other Production Time (Minutes)",
+}
 
 REPORT_REQUIRED_COLUMNS = [
     "REPORT_MONTH",
@@ -496,6 +507,29 @@ def fetch_sheet_df_by_key(
     return df
 
 
+def normalize_internal_time_tracking_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """Map current Time Tracking headers to the report's canonical names."""
+    out = df.copy()
+    out.columns = [str(column).strip() for column in out.columns]
+
+    for column in list(out.columns):
+        normalized = " ".join(column.lower().split())
+        target = INTERNAL_TIME_TRACKING_HEADER_ALIASES.get(normalized)
+        if target is None or column == target:
+            continue
+
+        if target in out.columns:
+            # Prefer the canonical field when both header versions are present,
+            # while retaining a value supplied only through the renamed field.
+            target_is_blank = out[target].astype(str).str.strip().eq("")
+            out.loc[target_is_blank, target] = out.loc[target_is_blank, column]
+            out = out.drop(columns=column)
+        else:
+            out = out.rename(columns={column: target})
+
+    return out
+
+
 def prepare_hour_named_export_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     rename_map = {src: dst for src, dst in TRAINING_MINUTE_TO_HOUR_EXPORT_COLUMNS.items() if src in out.columns}
@@ -719,12 +753,7 @@ def build_project_report(
 
     internal_cols = [
         "Project you worked on (Use Ctrl+F to search your required information)",
-        "Annotation Time (Minutes)", "QA Time (Minutes)", "Crosscheck Time (Minutes)",
-        "Meeting Time (Minutes)", "Project Study (Minutes)",
-        "Training time (Minutes)",
-        "Resource Training (Minutes) - This section is for lead",
-        "Q&A Group support (Minutes)", "Documentation (Minutes)", "Demo (Minutes)",
-        "Break Time (Minutes)", "Server Downtime (Minutes)", "Free time (Minutes)",
+        *INTERNAL_TIME_TRACKING_MINUTE_COLUMNS,
     ]
 
     df_log = internal_log_data.copy()
@@ -736,14 +765,7 @@ def build_project_report(
     df_log["Month"] = infer_report_month_series(df_log)
     df_log = df_log[df_log["Month"].ne("")].copy()
 
-    minute_cols = [
-        "Annotation Time (Minutes)", "QA Time (Minutes)", "Crosscheck Time (Minutes)",
-        "Meeting Time (Minutes)", "Project Study (Minutes)",
-        "Training time (Minutes)",
-        "Resource Training (Minutes) - This section is for lead",
-        "Q&A Group support (Minutes)", "Documentation (Minutes)", "Demo (Minutes)",
-        "Break Time (Minutes)", "Server Downtime (Minutes)", "Free time (Minutes)",
-    ]
+    minute_cols = INTERNAL_TIME_TRACKING_MINUTE_COLUMNS
 
     for c in minute_cols:
         df_log[c] = pd.to_numeric(df_log[c], errors="coerce").fillna(0)
@@ -892,14 +914,7 @@ def build_merged_report(
         "QAI ID (Use Ctrl+F to search your required information)": "QAI ID",
     })
 
-    minute_cols = [
-        "Annotation Time (Minutes)", "QA Time (Minutes)", "Crosscheck Time (Minutes)",
-        "Meeting Time (Minutes)", "Project Study (Minutes)",
-        "Training time (Minutes)",
-        "Resource Training (Minutes) - This section is for lead",
-        "Q&A Group support (Minutes)", "Documentation (Minutes)", "Demo (Minutes)",
-        "Break Time (Minutes)", "Server Downtime (Minutes)", "Free time (Minutes)",
-    ]
+    minute_cols = INTERNAL_TIME_TRACKING_MINUTE_COLUMNS
 
     df_log = ensure_columns(df_log, minute_cols + ["Project Batch", "QAI ID"], 0)
     df_log["REPORT_MONTH"] = infer_report_month_series(df_log)
@@ -955,7 +970,11 @@ def build_time_tracking_hours_report(internal_log_data: pd.DataFrame) -> pd.Data
         df_log[c] = pd.to_numeric(df_log[c], errors="coerce").fillna(0) / 60
         df_log = df_log.rename(columns={c: INTERNAL_TIME_TRACKING_HOUR_RENAMES[c]})
 
-    df_log["Production Hours"] = df_log["Annotation Hours"] + df_log["QA Hours"]
+    df_log["Production Hours"] = (
+        df_log["Annotation Hours"]
+        + df_log["QA Hours"]
+        + df_log["Other Production Hours"]
+    )
     df_log["Other Time Tracking Hours"] = (
         df_log["Crosscheck Hours"]
         + df_log["Meeting Hours"]
@@ -1341,6 +1360,7 @@ def run(config: Config) -> None:
     # Load inputs
     project_data = fetch_sheet_df_by_key(client, config.project_sheet_key, config.project_tab)
     internal_log_data = fetch_sheet_df_by_key(client, config.internal_sheet_key, config.internal_tab)
+    internal_log_data = normalize_internal_time_tracking_headers(internal_log_data)
     attendance_df = fetch_sheet_df_by_key(client, config.delivery_sheet_key, config.delivery_worksheet_name)
     monthly_attendance_source_df = fetch_sheet_df_by_key(
         client,
