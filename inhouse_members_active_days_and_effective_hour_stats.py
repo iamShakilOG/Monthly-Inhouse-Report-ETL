@@ -150,7 +150,7 @@ REPORT_REQUIRED_COLUMNS = [
 
 ATTENDANCE_REQUIRED_COLUMNS = ["QAI ID", "Joining Date", "Role"]
 MONTHLY_ATTENDANCE_REQUIRED_COLUMNS = ["QAI ID"]
-RESIGNED_REQUIRED_COLUMNS = ["ID", "LWD"]
+TEAM_LIST_STATUS_REQUIRED_COLUMNS = ["QAI ID", "Last working day"]
 
 EXCLUDED_RESOURCE_TYPES = {"REMOTE", "CLIENT", "VENDOR"}
 
@@ -169,7 +169,6 @@ class Config:
     monthly_attendance_sheet_key: str
     monthly_attendance_worksheet_name: str
     monthly_attendance_header_row: int
-    resigned_worksheet_name: str
 
     # clickup
     clickup_api_token: str
@@ -254,7 +253,6 @@ def parse_args() -> Config:
         monthly_attendance_header_row=parse_optional_int(
             get_env("MONTHLY_ATTENDANCE_HEADER_ROW", "2")
         ) or 2,
-        resigned_worksheet_name=get_env("RESIGNED_WORKSHEET_NAME", "Resign/Terminated"),
         clickup_api_token=get_env("CLICKUP_API_TOKEN", required=True),
         clickup_list_id=get_env("CLICKUP_LIST_ID", required=True),
         output_sheet_key=get_env("OUTPUT_SHEET_KEY", "1IikdQL_2hwlOrqm0JZOdQ_DxZkCa012X_CsJmycmsi0"),
@@ -286,7 +284,6 @@ def validate_config(config: Config) -> None:
         "monthly_attendance_sheet_key": config.monthly_attendance_sheet_key,
         "monthly_attendance_worksheet_name": config.monthly_attendance_worksheet_name,
         "monthly_attendance_header_row": config.monthly_attendance_header_row,
-        "resigned_worksheet_name": config.resigned_worksheet_name,
         "clickup_api_token": config.clickup_api_token,
         "clickup_list_id": config.clickup_list_id,
         "output_sheet_key": config.output_sheet_key,
@@ -1200,36 +1197,25 @@ def attach_time_tracking_to_summary(summary_df: pd.DataFrame, time_tracking_look
     return out
 
 
-def build_status_mapping(attendance_df: pd.DataFrame, resigned_df: pd.DataFrame) -> pd.DataFrame:
-    require_columns(attendance_df, ["QAI ID"], "Team List & Activity worksheet")
-    require_columns(resigned_df, RESIGNED_REQUIRED_COLUMNS, "Resigned/Terminated worksheet")
+def build_status_mapping(attendance_df: pd.DataFrame) -> pd.DataFrame:
+    """Build employee status from Team List & Activity's Last working day column."""
+    require_columns(attendance_df, TEAM_LIST_STATUS_REQUIRED_COLUMNS, "Team List & Activity worksheet")
 
-    active_df = attendance_df.copy()
-    active_df["QAI ID"] = active_df["QAI ID"].astype(str).str.strip()
-    active_df = active_df[active_df["QAI ID"].ne("")].copy()
-    active_df = active_df[["QAI ID"]].drop_duplicates()
-    active_df["Status"] = "Active"
-    active_df["LWD"] = ""
+    status_df = attendance_df[["QAI ID", "Last working day"]].copy()
+    status_df["QAI ID"] = status_df["QAI ID"].astype(str).str.strip()
+    status_df["LWD"] = status_df["Last working day"].fillna("").apply(normalize_date_str)
+    status_df = status_df[status_df["QAI ID"].ne("")].copy()
 
-    resigned_clean = resigned_df.copy()
-    resigned_clean["QAI ID"] = resigned_clean["ID"].astype(str).str.strip()
-    resigned_clean["LWD"] = resigned_clean["LWD"].apply(normalize_date_str)
-    resigned_clean = resigned_clean[resigned_clean["QAI ID"].ne("")].copy()
-    resigned_clean = resigned_clean[["QAI ID", "LWD"]].drop_duplicates(subset=["QAI ID"], keep="first")
-    resigned_clean["Status"] = "Resigned/Terminated"
-
-    status_df = pd.concat(
-        [
-            resigned_clean[["QAI ID", "Status", "LWD"]],
-            active_df[["QAI ID", "Status", "LWD"]],
-        ],
-        ignore_index=True,
+    # A populated Last working day means the person has resigned/been terminated.
+    # If the team list contains duplicate IDs, retain a populated LWD when present.
+    status_df = (
+        status_df.groupby("QAI ID", as_index=False)["LWD"]
+        .agg(most_common_non_empty)
     )
-
-    status_df["priority"] = status_df["Status"].map({"Active": 2, "Resigned/Terminated": 1}).fillna(0)
-    status_df = status_df.sort_values(["QAI ID", "priority"], ascending=[True, False], kind="stable")
-    status_df = status_df.drop_duplicates(subset=["QAI ID"], keep="first").drop(columns=["priority"])
-    return status_df.reset_index(drop=True)
+    status_df["Status"] = status_df["LWD"].ne("").map(
+        {True: "Resigned/Terminated", False: "Active"}
+    )
+    return status_df[["QAI ID", "Status", "LWD"]]
 
 
 def enrich_summary(
@@ -1362,7 +1348,6 @@ def run(config: Config) -> None:
         config.monthly_attendance_worksheet_name,
         header_row=config.monthly_attendance_header_row,
     )
-    resigned_df = fetch_sheet_df_by_key(client, config.delivery_sheet_key, config.resigned_worksheet_name)
 
     # ClickUp
     fetcher = ClickUpIndustryFetcher(config.clickup_api_token, config.clickup_list_id)
@@ -1399,7 +1384,7 @@ def run(config: Config) -> None:
     )
     time_tracking_lookup_df = build_time_tracking_lookup(time_tracking_hours_df)
     summary_base_df = attach_time_tracking_to_summary(summary_base_df, time_tracking_lookup_df)
-    status_df = build_status_mapping(attendance_df, resigned_df)
+    status_df = build_status_mapping(attendance_df)
     summary_df = enrich_summary(summary_base_df, monthly_attendance_df, roster_metadata_df, status_df)
 
     inhouse_df = build_inhouse_report(summary_df)

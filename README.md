@@ -83,6 +83,8 @@ Set up the following secrets in your GitHub repository settings:
 - `OUTPUT_SUMMARY_WORKSHEET`: Output worksheet name for summary (default: "Summary")
 - `REPORT_YEAR_FILTER`: Year filter (default: "2026")
 
+Employee status is sourced from the `Last working day` column in `Team List & Activity`: a populated value marks the employee as `Resigned/Terminated`; a blank value marks them `Active`.
+
 The workflow will automatically:
 1. Check out the code
 2. Set up Python environment
